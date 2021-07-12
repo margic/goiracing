@@ -1,6 +1,7 @@
 package iracing
 
 import (
+	"fmt"
 	"unsafe"
 
 	"go.uber.org/zap"
@@ -13,7 +14,8 @@ type IRClient struct {
 	logger *zap.Logger
 	irPtr  uintptr // unsafe pointer to iracing mem mapped file
 	// headerSlice Mmap    // a slice that represents the ir header in the mem mapped file
-	irHeader *IRHeader
+	irHeader          *IRHeader
+	irSessionInfoYaml string
 }
 
 func NewIRClient(logger *zap.Logger) *IRClient {
@@ -53,9 +55,10 @@ func (ir *IRClient) Open() error {
 	}
 	ir.irPtr = addr
 
+	// set up a slice using the windows pointer to mem map file
 	irHeaderSlice := Mmap{}
 	h := irHeaderSlice.Header()
-	h.Data = addr
+	h.Data = ir.irPtr
 	h.Cap = headerLengthBytes
 	h.Len = headerLengthBytes
 
@@ -76,5 +79,25 @@ func (ir *IRClient) Open() error {
 		zap.Uint32("varOffset", ir.irHeader.VarHeaderOffset),
 		zap.Uint32("numBuf", ir.irHeader.NumBuf),
 		zap.Uint32("BufLen", ir.irHeader.BufLen))
+
+	ir.irSessionInfoYaml = ir.readSession()
+	ir.logger.Debug("session info string", zap.String("session", ir.irSessionInfoYaml))
 	return nil
+}
+
+func (ir *IRClient) readSession() string {
+	// setup a slice around the area of the file with the session data in it
+	// we'll find a more efficient way to deal with this once its working
+	irSessionInfoSlice := Mmap{}
+	// set the slice header to make this slice point to our data
+	h := irSessionInfoSlice.Header()
+	h.Data = ir.irPtr + uintptr(ir.irHeader.SessionInfoOffset) + 4
+	h.Cap = int(ir.irHeader.SessionInfoLen - 1)
+	h.Len = int(ir.irHeader.SessionInfoLen - 1)
+
+	// h.Cap = int(ir.irHeader.SessionInfoLen + ir.irHeader.SessionInfoOffset)
+	// h.Len = int(ir.irHeader.SessionInfoLen + ir.irHeader.SessionInfoOffset)
+
+	// TODO Working here trying to read the session info data. Having issues with the size of the info data
+	return fmt.Sprintf("irSessionInfoSlice %d", len(irSessionInfoSlice))
 }
