@@ -7,7 +7,7 @@ import (
 // IRHeader represents the iracing memory mapped file header.
 // This must be read to know where the offsets for the information about the which
 // iracing variables are available.
-type IRHeader struct {
+type Header struct {
 	Ver      uint32 // api header version
 	Status   uint32 // irsdk_StatusField
 	TickRate uint32 // refresh rate being used by iracing to update the telemetry eg 60 or 360 Hz
@@ -24,13 +24,13 @@ type IRHeader struct {
 	BufLen uint32
 	Pad1   [2]uint32
 
-	bufInfos [4]IRBufInfo
+	bufInfos [4]BufInfo
 }
 
 const headerLengthBytes = 48 // number of bytes the iracing header consumes at start of mem mapped file
 
-func NewIRHeader(b []byte) (*IRHeader, error) {
-	h := &IRHeader{
+func NewHeader(b []byte) (*Header, error) {
+	h := &Header{
 		Ver:               binary.LittleEndian.Uint32(b[0:4]),
 		Status:            binary.LittleEndian.Uint32(b[4:8]),
 		TickRate:          binary.LittleEndian.Uint32(b[8:12]),
@@ -48,7 +48,7 @@ func NewIRHeader(b []byte) (*IRHeader, error) {
 	return h, nil
 }
 
-type IRBufInfo struct {
+type BufInfo struct {
 	TickCount uint32
 	BufOffset uint32
 	Pad       [2]uint32

@@ -13,15 +13,15 @@ import (
 func main() {
 	logger := newLogger()
 	defer logger.Sync()
-	irClient := iracing.NewIRClient(logger)
+	client := iracing.NewClient(logger)
 
-	err := irClient.Open()
+	err := client.Open()
 	if err != nil {
 		logger.Error("Error opening iracing client",
 			zap.Error(err))
 		os.Exit(1)
 	}
-	defer irClient.Close()
+	defer client.Close()
 
 	// start a time loop
 	go func() {
