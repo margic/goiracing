@@ -2,6 +2,7 @@ package iracing
 
 import (
 	"fmt"
+	"strings"
 	"unsafe"
 
 	"go.uber.org/zap"
@@ -91,13 +92,16 @@ func (ir *Client) readSession() string {
 	sessionInfoSlice := Mmap{}
 	// set the slice header to make this slice point to our data
 	h := sessionInfoSlice.Header()
-	h.Data = ir.ptr + uintptr(ir.header.SessionInfoOffset) + 4
-	h.Cap = int(ir.header.SessionInfoLen - 1)
-	h.Len = int(ir.header.SessionInfoLen - 1)
+	h.Data = ir.ptr + uintptr(ir.header.SessionInfoOffset)
+	h.Cap = int(ir.header.SessionInfoLen)
+	h.Len = int(ir.header.SessionInfoLen)
 
 	// h.Cap = int(ir.irHeader.SessionInfoLen + ir.irHeader.SessionInfoOffset)
 	// h.Len = int(ir.irHeader.SessionInfoLen + ir.irHeader.SessionInfoOffset)
 
 	// TODO Working here trying to read the session info data. Having issues with the size of the info data
-	return fmt.Sprintf("irSessionInfoSlice %d", len(sessionInfoSlice))
+	infoStr := string(sessionInfoSlice)
+	h.Len = strings.LastIndex(infoStr, "...")
+	infoStr = string(sessionInfoSlice)
+	return fmt.Sprintf("irSessionInfoSlice %s", infoStr)
 }
