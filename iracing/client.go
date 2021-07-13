@@ -3,6 +3,7 @@ package iracing
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"unsafe"
 
@@ -11,17 +12,26 @@ import (
 )
 
 const iracingMemoryMappedFileName string = "Local\\IRSDKMemMapFileName"
+const (
+	success = iota
+	fileError
+	readError
+)
 
 type Client struct {
 	logger *zap.Logger
 	ptr    uintptr // unsafe pointer to iracing mem mapped file
 	// headerSlice Mmap    // a slice that represents the ir header in the mem mapped file
 	header          *Header
-	sessionInfoYaml string
+	SessionInfoYaml string
 }
 
-func NewClient() *Client {
-	logger := newLogger()
+type ClientConfig struct {
+	Debug bool
+}
+
+func NewClient(cfg *ClientConfig) *Client {
+	logger := newLogger(cfg.Debug)
 	return &Client{
 		logger: logger,
 	}
@@ -37,11 +47,14 @@ func (ir *Client) Close() error {
 // Calling Use(p) ensures that p is kept live until that point.
 func use(unsafe.Pointer) {}
 
-func (ir *Client) Open() error {
+func (ir *Client) Open() {
 	ir.logger.Debug("opening iracing memory mapped file", zap.String("filename", iracingMemoryMappedFileName))
 	ptrName, err := windows.UTF16PtrFromString(iracingMemoryMappedFileName)
 	if err != nil {
-		return err
+		ir.logger.Error("Error creating windows pointer from file name",
+			zap.String("filename", iracingMemoryMappedFileName),
+			zap.Error(err))
+		os.Exit(fileError)
 	}
 	uPtrName := unsafe.Pointer(ptrName)
 
@@ -49,13 +62,19 @@ func (ir *Client) Open() error {
 	procOpenFileMapping := modkernel32.NewProc("OpenFileMappingW")
 	winHandle, _, err := procOpenFileMapping.Call(uintptr(4), uintptr(0), uintptr(uPtrName))
 	if winHandle == 0 && err != nil {
-		return err
+		ir.logger.Error("Error opening windows memory mapped file",
+			zap.String("filename", iracingMemoryMappedFileName),
+			zap.Error(err))
+		os.Exit(fileError)
 	}
 	use(uPtrName) // see use
 
 	addr, err := windows.MapViewOfFile(windows.Handle(winHandle), uint32(windows.FILE_MAP_READ), 0, 0, 0)
 	if err != nil {
-		return err
+		ir.logger.Error("Error creating map view of file",
+			zap.String("filename", iracingMemoryMappedFileName),
+			zap.Error(err))
+		os.Exit(fileError)
 	}
 	ir.ptr = addr
 
@@ -69,7 +88,12 @@ func (ir *Client) Open() error {
 	// create new header to parse bytes
 	ir.header, err = NewHeader(headerSlice)
 	if err != nil {
-		return err
+		ir.logger.Error("Error parsing iracing header",
+			zap.String("filename", iracingMemoryMappedFileName),
+			zap.Int("iracingPointer", int(ir.ptr)),
+			zap.Int("headerLength", headerLengthBytes),
+			zap.Error(err))
+		os.Exit(readError)
 	}
 
 	ir.logger.Debug("iracing header",
@@ -84,9 +108,8 @@ func (ir *Client) Open() error {
 		zap.Uint32("numBuf", ir.header.NumBuf),
 		zap.Uint32("BufLen", ir.header.BufLen))
 
-	ir.sessionInfoYaml = ir.readSession()
-	ir.logger.Debug("session info string", zap.String("session", ir.sessionInfoYaml))
-	return nil
+	ir.SessionInfoYaml = ir.readSession()
+	ir.logger.Debug("session info string", zap.String("session", ir.SessionInfoYaml))
 }
 
 func (ir *Client) readSession() string {
@@ -106,12 +129,18 @@ func (ir *Client) readSession() string {
 	infoStr := string(sessionInfoSlice)
 	h.Len = strings.LastIndex(infoStr, "...")
 	infoStr = string(sessionInfoSlice)
-	return fmt.Sprintf("irSessionInfoSlice %s", infoStr)
+	return infoStr
 }
 
-func newLogger() *zap.Logger {
-	rawJSON := []byte(`{
-		"level": "debug",
+func newLogger(debug bool) *zap.Logger {
+	var level string
+	if debug {
+		level = "debug"
+	} else {
+		level = "info"
+	}
+	cfgStr := `{
+		"level": "%s",
 		"encoding": "json",
 		"outputPaths": ["stdout"],
 		"errorOutputPaths": ["stderr"],
@@ -121,7 +150,9 @@ func newLogger() *zap.Logger {
 		  "levelKey": "level",
 		  "levelEncoder": "lowercase"
 		}
-	  }`)
+	  }`
+
+	rawJSON := []byte(fmt.Sprintf(cfgStr, level))
 
 	var cfg zap.Config
 	if err := json.Unmarshal(rawJSON, &cfg); err != nil {

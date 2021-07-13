@@ -16,6 +16,8 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/margic/goiracing/iracing"
 	"github.com/spf13/cobra"
 )
@@ -32,9 +34,11 @@ var sessionCmd = &cobra.Command{
 }
 
 func sessioninfo() {
-	client := iracing.NewClient()
+	client := iracing.NewClient(ClientConfig())
 	client.Open()
 	defer client.Close()
+
+	fmt.Printf("SessionInfo: %s\n", client.SessionInfoYaml)
 }
 
 func init() {
