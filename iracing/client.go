@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"unsafe"
 
 	"go.uber.org/zap"
@@ -22,7 +21,8 @@ type Client struct {
 	logger *zap.Logger
 	ptr    uintptr // unsafe pointer to iracing mem mapped file
 	// headerSlice Mmap    // a slice that represents the ir header in the mem mapped file
-	header          *Header
+	header          *header
+	varHeaders      map[string]*varHeader // I think this may change frequently depends on if offsets are static consider a lock
 	SessionInfoYaml string
 }
 
@@ -82,19 +82,11 @@ func (ir *Client) Open() {
 	headerSlice := Mmap{}
 	h := headerSlice.Header()
 	h.Data = ir.ptr
-	h.Cap = headerLengthBytes
-	h.Len = headerLengthBytes
+	h.Cap = headerLength
+	h.Len = headerLength
 
 	// create new header to parse bytes
-	ir.header, err = NewHeader(headerSlice)
-	if err != nil {
-		ir.logger.Error("Error parsing iracing header",
-			zap.String("filename", iracingMemoryMappedFileName),
-			zap.Int("iracingPointer", int(ir.ptr)),
-			zap.Int("headerLength", headerLengthBytes),
-			zap.Error(err))
-		os.Exit(readError)
-	}
+	ir.header = newHeader(headerSlice)
 
 	ir.logger.Debug("iracing header",
 		zap.Uint32("version", ir.header.Ver),
@@ -110,6 +102,33 @@ func (ir *Client) Open() {
 
 	ir.SessionInfoYaml = ir.readSession()
 	ir.logger.Debug("session info string", zap.String("session", ir.SessionInfoYaml))
+	ir.readVariableHeaders()
+}
+
+func (ir *Client) readVariableHeaders() {
+	// setup a slice around the variable headers data in the iracing ptr based on offet and variable header length
+	varHeaderSlice := Mmap{}
+	h := varHeaderSlice.Header()
+	h.Data = ir.ptr + uintptr(ir.header.VarHeaderOffset)
+	h.Cap = varHeaderLenth * int(ir.header.NumVars)
+	h.Len = varHeaderLenth * int(ir.header.NumVars)
+
+	// initialize a map to store telementry variable headers mapped by name
+	varHeaders := make(map[string]*varHeader)
+
+	// loop through the variable headers byte slice to read ir.header.NumVars headers and create a variable header to add to map
+	for i := 0; i < int(ir.header.NumVars); i++ {
+		b := varHeaderSlice[i*varHeaderLenth : (i+1)*varHeaderLenth]
+		h := newVarHeader(b)
+		varHeaders[h.name] = h
+		ir.logger.Debug("variable header",
+			zap.String("name", h.name),
+			zap.String("description", h.desc),
+			zap.String("type", h.t.String()),
+		)
+	}
+	ir.logger.Debug("parsed variable headers", zap.Int("numvars", int(ir.header.NumVars)))
+	ir.varHeaders = varHeaders
 }
 
 func (ir *Client) readSession() string {
@@ -126,9 +145,7 @@ func (ir *Client) readSession() string {
 	// h.Len = int(ir.irHeader.SessionInfoLen + ir.irHeader.SessionInfoOffset)
 
 	// TODO Working here trying to read the session info data. Having issues with the size of the info data
-	infoStr := string(sessionInfoSlice)
-	h.Len = strings.LastIndex(infoStr, "...")
-	infoStr = string(sessionInfoSlice)
+	infoStr := windows.ByteSliceToString(sessionInfoSlice)
 	return infoStr
 }
 
