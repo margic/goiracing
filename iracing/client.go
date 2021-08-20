@@ -3,7 +3,7 @@ package iracing
 import (
 	"encoding/json"
 	"fmt"
-	"os"
+	"time"
 	"unsafe"
 
 	"go.uber.org/zap"
@@ -24,57 +24,50 @@ type Client struct {
 	header          *header
 	varHeaders      map[string]*varHeader // I think this may change frequently depends on if offsets are static consider a lock
 	SessionInfoYaml string
+	stop            bool
+	retryInterval   int
 }
 
 type ClientConfig struct {
-	Debug bool
+	Debug         bool
+	RetryInterval int
 }
 
 func NewClient(cfg *ClientConfig) *Client {
 	logger := newLogger(cfg.Debug)
-	return &Client{
+	client := &Client{
 		logger: logger,
 	}
+	if cfg.RetryInterval > 0 {
+		client.retryInterval = cfg.RetryInterval
+	} else {
+		client.retryInterval = 10
+	}
+	return client
 }
 
-func (ir *Client) Close() error {
+func (ir *Client) Close() {
 	ir.logger.Sync()
-	return nil
+	ir.stop = true
 }
 
 // Use was taken from syscall package:
 // Use is a no-op, but the compiler cannot see that it is.
 // Calling Use(p) ensures that p is kept live until that point.
-func use(unsafe.Pointer) {}
+func (ir *Client) use(unsafe.Pointer) {}
 
-func (ir *Client) Open() {
-	ir.logger.Debug("opening iracing memory mapped file", zap.String("filename", iracingMemoryMappedFileName))
-	ptrName, err := windows.UTF16PtrFromString(iracingMemoryMappedFileName)
+func (ir *Client) Open() error {
+	winHandle, err := ir.openIracingFile()
 	if err != nil {
-		ir.logger.Error("Error creating windows pointer from file name",
-			zap.String("filename", iracingMemoryMappedFileName),
-			zap.Error(err))
-		os.Exit(fileError)
+		return err
 	}
-	uPtrName := unsafe.Pointer(ptrName)
-
-	modkernel32 := windows.NewLazyDLL("kernel32.dll")
-	procOpenFileMapping := modkernel32.NewProc("OpenFileMappingW")
-	winHandle, _, err := procOpenFileMapping.Call(uintptr(4), uintptr(0), uintptr(uPtrName))
-	if winHandle == 0 && err != nil {
-		ir.logger.Error("Error opening windows memory mapped file",
-			zap.String("filename", iracingMemoryMappedFileName),
-			zap.Error(err))
-		os.Exit(fileError)
-	}
-	use(uPtrName) // see use
 
 	addr, err := windows.MapViewOfFile(windows.Handle(winHandle), uint32(windows.FILE_MAP_READ), 0, 0, 0)
 	if err != nil {
 		ir.logger.Error("Error creating map view of file",
 			zap.String("filename", iracingMemoryMappedFileName),
 			zap.Error(err))
-		os.Exit(fileError)
+		return err
 	}
 	ir.ptr = addr
 
@@ -103,6 +96,39 @@ func (ir *Client) Open() {
 	ir.SessionInfoYaml = ir.readSession()
 	ir.logger.Debug("session info string", zap.String("session", ir.SessionInfoYaml))
 	ir.readVariableHeaders()
+	return nil
+}
+
+// openIracingFile will loop and wait for an iracing file to exist.
+func (ir *Client) openIracingFile() (uintptr, error) {
+
+	// An iracing file only exists if iRacing is actually running
+	ir.logger.Debug("opening iracing memory mapped file", zap.String("filename", iracingMemoryMappedFileName))
+	ptrName, err := windows.UTF16PtrFromString(iracingMemoryMappedFileName)
+	if err != nil {
+		ir.logger.Error("Error creating windows pointer from file name",
+			zap.String("filename", iracingMemoryMappedFileName),
+			zap.Error(err))
+		return 0, nil
+	}
+	uPtrName := unsafe.Pointer(ptrName)
+
+	for !ir.stop {
+		// open the file and get a ptr
+		modkernel32 := windows.NewLazyDLL("kernel32.dll")
+		procOpenFileMapping := modkernel32.NewProc("OpenFileMappingW")
+		winHandle, _, err := procOpenFileMapping.Call(uintptr(4), uintptr(0), uintptr(uPtrName))
+		if winHandle == 0 && err != nil {
+			ir.logger.Debug("Error opening windows memory mapped file",
+				zap.String("filename", iracingMemoryMappedFileName),
+				zap.Error(err))
+			time.Sleep(time.Duration(ir.retryInterval) * time.Second)
+		}
+
+		ir.use(uPtrName) // see use, if wierd stuff happens may have to look at winHandle too
+	}
+
+	return 0, nil
 }
 
 func (ir *Client) readVariableHeaders() {
