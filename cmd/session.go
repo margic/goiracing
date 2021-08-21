@@ -16,8 +16,6 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
-
 	"github.com/margic/goiracing/iracing"
 	"github.com/spf13/cobra"
 )
@@ -29,16 +27,9 @@ var sessionCmd = &cobra.Command{
 	Long: `Output iRacing Session Infomraiton. Dumps the yaml formatted string of
 		session information from iRacing. Use flags to direct output as required.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		sessioninfo()
+		client := iracing.NewClient(ClientConfig())
+		client.Session()
 	},
-}
-
-func sessioninfo() {
-	client := iracing.NewClient(ClientConfig())
-	client.Open()
-	defer client.Close()
-
-	fmt.Printf("SessionInfo: %s\n", client.SessionInfoYaml)
 }
 
 func init() {

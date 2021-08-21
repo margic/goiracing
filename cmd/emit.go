@@ -29,13 +29,12 @@ var emitCmd = &cobra.Command{
 		The intention of emit is to enalbe goiracing to continually read `,
 	Run: func(cmd *cobra.Command, args []string) {
 		cfg := &iracing.ClientConfig{
-			Debug: true,
+			Debug:         true,
+			RetryInterval: 5,
 		}
 
 		client := iracing.NewClient(cfg)
-
-		client.Open()
-		defer client.Close()
+		client.Emit()
 	},
 }
 

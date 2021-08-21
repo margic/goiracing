@@ -11,21 +11,21 @@ import (
 )
 
 const iracingMemoryMappedFileName string = "Local\\IRSDKMemMapFileName"
-const (
-	success = iota
-	fileError
-	readError
-)
+const closed = "closed"
+const ready = "ready"
 
 type Client struct {
-	logger *zap.Logger
-	ptr    uintptr // unsafe pointer to iracing mem mapped file
+	logger         *zap.Logger
+	irMemMapedFile uintptr // unsafe pointer to iracing mem mapped file
 	// headerSlice Mmap    // a slice that represents the ir header in the mem mapped file
-	header          *header
-	varHeaders      map[string]*varHeader // I think this may change frequently depends on if offsets are static consider a lock
-	SessionInfoYaml string
-	stop            bool
-	retryInterval   int
+	header               *IRHeader
+	varHeaders           map[string]*varHeader // I think this may change frequently depends on if offsets are static consider a lock
+	SessionInfoYaml      string
+	stop                 bool
+	retryInterval        int
+	sessionInfoTickCount int
+	varBufTickCount      int
+	status               string
 }
 
 type ClientConfig struct {
@@ -33,22 +33,59 @@ type ClientConfig struct {
 	RetryInterval int
 }
 
+func (ir *Client) Emit() {
+	err := ir.open()
+	if err != nil {
+		ir.logger.Error("error opening client", zap.Error(err))
+		return
+	}
+	defer ir.close()
+
+	err = ir.readHeader()
+	if err != nil {
+		ir.logger.Error("error reading iracing header", zap.Error(err))
+	}
+
+	err = ir.readVarHeaders()
+	if err != nil {
+		ir.logger.Error("error reading variable headers", zap.Error(err))
+	}
+}
+
+func (ir *Client) Session() {
+	err := ir.open()
+	if err != nil {
+		ir.logger.Error("error opening client", zap.Error(err))
+		return
+	}
+	defer ir.close()
+
+	err = ir.readHeader()
+	if err != nil {
+		ir.logger.Error("error reading iracing header", zap.Error(err))
+	}
+	fmt.Printf(ir.SessionInfoYaml)
+}
+
 func NewClient(cfg *ClientConfig) *Client {
 	logger := newLogger(cfg.Debug)
-	client := &Client{
+	c := &Client{
 		logger: logger,
 	}
 	if cfg.RetryInterval > 0 {
-		client.retryInterval = cfg.RetryInterval
+		c.retryInterval = cfg.RetryInterval
 	} else {
-		client.retryInterval = 10
+		c.retryInterval = 10
 	}
-	return client
+	c.status = closed
+	return c
 }
 
-func (ir *Client) Close() {
+func (ir *Client) close() {
+	ir.logger.Debug("closing iracing client")
 	ir.logger.Sync()
 	ir.stop = true
+	ir.status = closed
 }
 
 // Use was taken from syscall package:
@@ -56,12 +93,15 @@ func (ir *Client) Close() {
 // Calling Use(p) ensures that p is kept live until that point.
 func (ir *Client) use(unsafe.Pointer) {}
 
-func (ir *Client) Open() error {
+func (ir *Client) open() error {
+	if ir.status != closed {
+		return fmt.Errorf("invalid client status for open iracing mem mapped file status %s", ir.status)
+	}
 	winHandle, err := ir.openIracingFile()
 	if err != nil {
 		return err
 	}
-
+	ir.logger.Debug("opening map view of file")
 	addr, err := windows.MapViewOfFile(windows.Handle(winHandle), uint32(windows.FILE_MAP_READ), 0, 0, 0)
 	if err != nil {
 		ir.logger.Error("Error creating map view of file",
@@ -69,38 +109,16 @@ func (ir *Client) Open() error {
 			zap.Error(err))
 		return err
 	}
-	ir.ptr = addr
-
-	// set up a slice using the windows pointer to mem map file
-	headerSlice := Mmap{}
-	h := headerSlice.Header()
-	h.Data = ir.ptr
-	h.Cap = headerLength
-	h.Len = headerLength
-
-	// create new header to parse bytes
-	ir.header = newHeader(headerSlice)
-
-	ir.logger.Debug("iracing header",
-		zap.Uint32("version", ir.header.Ver),
-		zap.Uint32("status", ir.header.Status),
-		zap.Uint32("tickrate", ir.header.TickRate),
-		zap.Uint32("sessionInfoUpdate", ir.header.SessionInfoUpdate),
-		zap.Uint32("infolength", ir.header.SessionInfoLen),
-		zap.Uint32("infoOffset", ir.header.SessionInfoOffset),
-		zap.Uint32("numVars", ir.header.NumVars),
-		zap.Uint32("varOffset", ir.header.VarHeaderOffset),
-		zap.Uint32("numBuf", ir.header.NumBuf),
-		zap.Uint32("BufLen", ir.header.BufLen))
-
-	ir.SessionInfoYaml = ir.readSession()
-	ir.logger.Debug("session info string", zap.String("session", ir.SessionInfoYaml))
-	ir.readVariableHeaders()
+	ir.logger.Debug("got map view of file", zap.Uintptr("address", addr))
+	ir.irMemMapedFile = addr
 	return nil
 }
 
 // openIracingFile will loop and wait for an iracing file to exist.
 func (ir *Client) openIracingFile() (uintptr, error) {
+	if ir.status != closed {
+		return 0, fmt.Errorf("invalid client status for openIracingFile status %s", ir.status)
+	}
 
 	// An iracing file only exists if iRacing is actually running
 	ir.logger.Debug("opening iracing memory mapped file", zap.String("filename", iracingMemoryMappedFileName))
@@ -112,8 +130,8 @@ func (ir *Client) openIracingFile() (uintptr, error) {
 		return 0, nil
 	}
 	uPtrName := unsafe.Pointer(ptrName)
-
-	for !ir.stop {
+	ir.logger.Debug("calling windows function OpenFileMappingW")
+	for !ir.stop && ir.status == closed {
 		// open the file and get a ptr
 		modkernel32 := windows.NewLazyDLL("kernel32.dll")
 		procOpenFileMapping := modkernel32.NewProc("OpenFileMappingW")
@@ -124,18 +142,57 @@ func (ir *Client) openIracingFile() (uintptr, error) {
 				zap.Error(err))
 			time.Sleep(time.Duration(ir.retryInterval) * time.Second)
 		}
-
-		ir.use(uPtrName) // see use, if wierd stuff happens may have to look at winHandle too
+		if winHandle > 0 {
+			ir.logger.Debug("got ptr to iracing mem mapped file", zap.Uintptr("ptr", winHandle))
+			ir.status = ready
+			return winHandle, nil
+		}
 	}
-
+	ir.use(uPtrName) // see use, if wierd stuff happens may have to look at winHandle too
 	return 0, nil
 }
 
-func (ir *Client) readVariableHeaders() {
+func (ir *Client) readHeader() error {
+	if ir.status != ready {
+		return fmt.Errorf("invalid client status for readHeader status %s", ir.status)
+	}
+	// set up a slice using the windows pointer to mem map file
+	headerSlice := Mmap{}
+	h := headerSlice.Header()
+	h.Data = ir.irMemMapedFile
+	h.Cap = headerLength
+	h.Len = headerLength
+
+	// parse headerSlice into a new IRHeader struct
+	ir.header = newHeader(headerSlice)
+
+	if ir.sessionInfoTickCount != ir.header.SessionInfoTickCount {
+		ir.logger.Debug("Session info is new. Read session info.", zap.Int("oldTickCount", ir.sessionInfoTickCount), zap.Int("newTickCount", ir.header.SessionInfoTickCount))
+		ir.logger.Debug("iracing header",
+			zap.Int("version", ir.header.Ver),
+			zap.Int("status", ir.header.Status),
+			zap.Int("tickrate", ir.header.TickRate),
+			zap.Int("sessionInfoTickCount", ir.header.SessionInfoTickCount),
+			zap.Int("infolength", ir.header.SessionInfoLen),
+			zap.Int("infoOffset", ir.header.SessionInfoOffset),
+			zap.Int("numVars", ir.header.NumVars),
+			zap.Int("varOffset", ir.header.VarHeaderOffset),
+			zap.Int("numBuf", ir.header.NumBuf),
+			zap.Int("BufLen", ir.header.BufLen))
+		ir.sessionInfoTickCount = ir.header.SessionInfoTickCount
+		ir.readSession()
+	}
+	return nil
+}
+
+func (ir *Client) readVarHeaders() error {
+	if ir.status != ready {
+		return fmt.Errorf("invalid client status for readVarHeaders status %s", ir.status)
+	}
 	// setup a slice around the variable headers data in the iracing ptr based on offet and variable header length
 	varHeaderSlice := Mmap{}
 	h := varHeaderSlice.Header()
-	h.Data = ir.ptr + uintptr(ir.header.VarHeaderOffset)
+	h.Data = ir.irMemMapedFile + uintptr(ir.header.VarHeaderOffset)
 	h.Cap = varHeaderLenth * int(ir.header.NumVars)
 	h.Len = varHeaderLenth * int(ir.header.NumVars)
 
@@ -155,15 +212,19 @@ func (ir *Client) readVariableHeaders() {
 	}
 	ir.logger.Debug("parsed variable headers", zap.Int("numvars", int(ir.header.NumVars)))
 	ir.varHeaders = varHeaders
+	return nil
 }
 
-func (ir *Client) readSession() string {
+func (ir *Client) readSession() error {
+	if ir.status != ready {
+		return fmt.Errorf("invalid client status for readSession status %s", ir.status)
+	}
 	// setup a slice around the area of the file with the session data in it
 	// we'll find a more efficient way to deal with this once its working
 	sessionInfoSlice := Mmap{}
 	// set the slice header to make this slice point to our data
 	h := sessionInfoSlice.Header()
-	h.Data = ir.ptr + uintptr(ir.header.SessionInfoOffset)
+	h.Data = ir.irMemMapedFile + uintptr(ir.header.SessionInfoOffset)
 	h.Cap = int(ir.header.SessionInfoLen)
 	h.Len = int(ir.header.SessionInfoLen)
 
@@ -172,7 +233,9 @@ func (ir *Client) readSession() string {
 
 	// TODO Working here trying to read the session info data. Having issues with the size of the info data
 	infoStr := windows.ByteSliceToString(sessionInfoSlice)
-	return infoStr
+
+	ir.SessionInfoYaml = infoStr
+	return nil
 }
 
 func newLogger(debug bool) *zap.Logger {
