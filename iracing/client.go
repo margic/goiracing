@@ -1,8 +1,10 @@
 package iracing
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -11,8 +13,13 @@ import (
 )
 
 const iracingMemoryMappedFileName string = "Local\\IRSDKMemMapFileName"
-const closed = "closed"
-const ready = "ready"
+const (
+	closed = iota
+	open
+	loadedHeader
+	loadedVarHeaders
+	loadedVarBuf
+)
 
 type Client struct {
 	logger         *zap.Logger
@@ -25,7 +32,9 @@ type Client struct {
 	retryInterval        int
 	sessionInfoTickCount int
 	varBufTickCount      int
-	status               string
+	varBuf               []byte
+	varBufLock           sync.Mutex
+	status               int
 }
 
 type ClientConfig struct {
@@ -67,6 +76,39 @@ func (ir *Client) Session() {
 	fmt.Printf(ir.SessionInfoYaml)
 }
 
+func (ir *Client) Variables() {
+	err := ir.open()
+	if err != nil {
+		ir.logger.Error("error opening client", zap.Error(err))
+		return
+	}
+	defer ir.close()
+
+	err = ir.readHeader()
+	if err != nil {
+		ir.logger.Error("error reading iracing header", zap.Error(err))
+	}
+
+	err = ir.readVarHeaders()
+	if err != nil {
+		ir.logger.Error("error reading variable headers", zap.Error(err))
+	}
+
+	for name, header := range ir.varHeaders {
+		ir.logger.Debug("varHeader", zap.String("name", name), zap.String("desc", header.desc), zap.Int("offset", header.offset))
+	}
+
+	err = ir.readVarBuf()
+	if err != nil {
+		ir.logger.Error("error reading variable buffer", zap.Error(err))
+	}
+
+	err = ir.readVar()
+	if err != nil {
+		ir.logger.Error("error reading variable", zap.Error(err))
+	}
+}
+
 func NewClient(cfg *ClientConfig) *Client {
 	logger := newLogger(cfg.Debug)
 	c := &Client{
@@ -78,6 +120,7 @@ func NewClient(cfg *ClientConfig) *Client {
 		c.retryInterval = 10
 	}
 	c.status = closed
+	c.varBufTickCount = 0
 	return c
 }
 
@@ -95,7 +138,7 @@ func (ir *Client) use(unsafe.Pointer) {}
 
 func (ir *Client) open() error {
 	if ir.status != closed {
-		return fmt.Errorf("invalid client status for open iracing mem mapped file status %s", ir.status)
+		return fmt.Errorf("invalid client status for open iracing mem mapped file status %d", ir.status)
 	}
 	winHandle, err := ir.openIracingFile()
 	if err != nil {
@@ -117,7 +160,7 @@ func (ir *Client) open() error {
 // openIracingFile will loop and wait for an iracing file to exist.
 func (ir *Client) openIracingFile() (uintptr, error) {
 	if ir.status != closed {
-		return 0, fmt.Errorf("invalid client status for openIracingFile status %s", ir.status)
+		return 0, fmt.Errorf("invalid client status for openIracingFile status %d", ir.status)
 	}
 
 	// An iracing file only exists if iRacing is actually running
@@ -144,7 +187,7 @@ func (ir *Client) openIracingFile() (uintptr, error) {
 		}
 		if winHandle > 0 {
 			ir.logger.Debug("got ptr to iracing mem mapped file", zap.Uintptr("ptr", winHandle))
-			ir.status = ready
+			ir.status = open
 			return winHandle, nil
 		}
 	}
@@ -153,18 +196,11 @@ func (ir *Client) openIracingFile() (uintptr, error) {
 }
 
 func (ir *Client) readHeader() error {
-	if ir.status != ready {
-		return fmt.Errorf("invalid client status for readHeader status %s", ir.status)
+	if ir.status != open {
+		return fmt.Errorf("invalid client status for readHeader status %d", ir.status)
 	}
-	// set up a slice using the windows pointer to mem map file
-	headerSlice := Mmap{}
-	h := headerSlice.Header()
-	h.Data = ir.irMemMapedFile
-	h.Cap = headerLength
-	h.Len = headerLength
-
 	// parse headerSlice into a new IRHeader struct
-	ir.header = newHeader(headerSlice)
+	ir.header = newHeader(ir.irMemMapedFile)
 
 	if ir.sessionInfoTickCount != ir.header.SessionInfoTickCount {
 		ir.logger.Debug("Session info is new. Read session info.", zap.Int("oldTickCount", ir.sessionInfoTickCount), zap.Int("newTickCount", ir.header.SessionInfoTickCount))
@@ -182,12 +218,16 @@ func (ir *Client) readHeader() error {
 		ir.sessionInfoTickCount = ir.header.SessionInfoTickCount
 		ir.readSession()
 	}
+	for _, bufInfo := range ir.header.BufInfos {
+		ir.logger.Debug("bufInfo", zap.Int("tick", bufInfo.TickCount), zap.Int("offset", bufInfo.BufOffset))
+	}
+	ir.status = loadedHeader
 	return nil
 }
 
 func (ir *Client) readVarHeaders() error {
-	if ir.status != ready {
-		return fmt.Errorf("invalid client status for readVarHeaders status %s", ir.status)
+	if ir.status != loadedHeader {
+		return fmt.Errorf("invalid client status for readVarHeaders status %d", ir.status)
 	}
 	// setup a slice around the variable headers data in the iracing ptr based on offet and variable header length
 	varHeaderSlice := Mmap{}
@@ -204,20 +244,71 @@ func (ir *Client) readVarHeaders() error {
 		b := varHeaderSlice[i*varHeaderLenth : (i+1)*varHeaderLenth]
 		h := newVarHeader(b)
 		varHeaders[h.name] = h
-		ir.logger.Debug("variable header",
-			zap.String("name", h.name),
-			zap.String("description", h.desc),
-			zap.String("type", h.t.String()),
-		)
+		// ir.logger.Debug("variable header",
+		// 	zap.String("name", h.name),
+		// 	zap.String("description", h.desc),
+		// 	zap.String("type", h.t.String()),
+		// )
 	}
 	ir.logger.Debug("parsed variable headers", zap.Int("numvars", int(ir.header.NumVars)))
 	ir.varHeaders = varHeaders
+	ir.status = loadedVarHeaders
+	return nil
+}
+
+// readVarBuf reads the buf info from the header and determines which
+// buf is the active buffer based on the tick count in the header
+// once found the current buffer is copied into the client varBuf slice
+// varBuf will then be used to access the variables
+func (ir *Client) readVarBuf() error {
+	if ir.status != loadedVarHeaders {
+		return fmt.Errorf("invalid client statis for readVarBuf status %d", ir.status)
+	}
+
+	// lock the varBuf to prevent multiple go routines accessing while updating
+	ir.varBufLock.Lock()
+	defer ir.varBufLock.Unlock()
+
+	// selecting buffer
+	curBuf := 0
+	for i, bufInfo := range ir.header.BufInfos {
+		ir.logger.Debug("bufInfo", zap.Int("tickCount", bufInfo.TickCount), zap.Int("lastTick", ir.varBufTickCount))
+		// is this buffer from a more recent tick count
+		if bufInfo.TickCount > ir.varBufTickCount {
+			curBuf = i
+			ir.varBufTickCount = bufInfo.TickCount
+		}
+	}
+	ir.logger.Debug("reading variable buffer", zap.Int("currentBuffer", curBuf))
+
+	varBuffer := Mmap{}
+	h := varBuffer.Header()
+	h.Data = ir.irMemMapedFile + uintptr(ir.header.BufInfos[curBuf].BufOffset)
+	h.Cap = ir.header.BufLen
+	h.Len = ir.header.BufLen
+	ir.varBuf = varBuffer
+	ir.status = loadedVarBuf
+	return nil
+}
+
+func (ir *Client) readVar() error {
+	if ir.status != loadedVarBuf {
+		return fmt.Errorf("invalid client statis for readVar status %d", ir.status)
+	}
+
+	// before reading vars make sure buffer isn't rewritten
+	ir.varBufLock.Lock()
+	defer ir.varBufLock.Unlock()
+
+	vH := ir.varHeaders["RPM"]
+	revs := binary.LittleEndian.Uint32(ir.varBuf[vH.offset : vH.offset+4])
+	ir.logger.Debug("varriable", zap.Uint32("revs", revs))
 	return nil
 }
 
 func (ir *Client) readSession() error {
-	if ir.status != ready {
-		return fmt.Errorf("invalid client status for readSession status %s", ir.status)
+	if ir.status > loadedHeader {
+		return fmt.Errorf("invalid client status for readSession status %d", ir.status)
 	}
 	// setup a slice around the area of the file with the session data in it
 	// we'll find a more efficient way to deal with this once its working
