@@ -4,6 +4,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 	"unsafe"
@@ -42,23 +45,82 @@ type ClientConfig struct {
 	RetryInterval int
 }
 
-func (ir *Client) Emit() {
+func (ir *Client) Emit(varName string) {
+	// TODO change how we open the file so it's retry is within scope of graceful shutdown
 	err := ir.open()
 	if err != nil {
 		ir.logger.Error("error opening client", zap.Error(err))
 		return
 	}
-	defer ir.close()
 
+	// pre read header
 	err = ir.readHeader()
 	if err != nil {
 		ir.logger.Error("error reading iracing header", zap.Error(err))
 	}
 
+	// pre read var headers
 	err = ir.readVarHeaders()
 	if err != nil {
 		ir.logger.Error("error reading variable headers", zap.Error(err))
 	}
+
+	// Start background tasks to read variables bufs and keep them refreshed
+	// also start variable read background tasks to read
+
+	// setup signal channels to run reads in background
+	sigReadVarBuf := make(chan bool, 1)
+	sigReadVar := make(chan string, 16)
+
+	// start ticker to invoke variable reads
+	ticker := time.NewTicker(100 * time.Millisecond)
+	go func() {
+		for {
+			t := <-ticker.C
+			ir.logger.Debug("TEMP debug. Ticker ticked read varBufs", zap.Time("tick", t))
+			err := ir.readVarBuf()
+			if err != nil {
+				ir.logger.Error("error reading variable buffer", zap.Error(err))
+			}
+			sigReadVarBuf <- true
+		}
+	}()
+
+	go func() {
+		for {
+			<-sigReadVarBuf
+			ir.logger.Debug("read variable", zap.String("name", varName))
+			// will have to have a precache of variable offsets to read. Think about that later
+			// currently throwing only one value
+			sigReadVar <- varName
+		}
+	}()
+
+	go func() {
+		// setup output
+		o := &Output{}
+		out := o.OutputChannel()
+		// then read names to read values for
+		for {
+			name := <-sigReadVar
+			iv, err := ir.readVar(name)
+			if err != nil {
+				ir.logger.Error("error reading variable", zap.String("name", name), zap.Error(err))
+			}
+			out <- iv
+		}
+
+	}()
+
+	// graceful shutdown figure this out once it works
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+	ticker.Stop()
+
+	time.Sleep(100 * time.Millisecond)
+
+	ir.close()
 }
 
 func (ir *Client) Session() {
@@ -103,10 +165,10 @@ func (ir *Client) Variables() {
 		ir.logger.Error("error reading variable buffer", zap.Error(err))
 	}
 
-	err = ir.readVar()
-	if err != nil {
-		ir.logger.Error("error reading variable", zap.Error(err))
-	}
+	// err = ir.readVar()
+	// if err != nil {
+	// 	ir.logger.Error("error reading variable", zap.Error(err))
+	// }
 }
 
 func NewClient(cfg *ClientConfig) *Client {
@@ -226,7 +288,7 @@ func (ir *Client) readHeader() error {
 }
 
 func (ir *Client) readVarHeaders() error {
-	if ir.status != loadedHeader {
+	if ir.status < loadedHeader {
 		return fmt.Errorf("invalid client status for readVarHeaders status %d", ir.status)
 	}
 	// setup a slice around the variable headers data in the iracing ptr based on offet and variable header length
@@ -261,8 +323,8 @@ func (ir *Client) readVarHeaders() error {
 // once found the current buffer is copied into the client varBuf slice
 // varBuf will then be used to access the variables
 func (ir *Client) readVarBuf() error {
-	if ir.status != loadedVarHeaders {
-		return fmt.Errorf("invalid client statis for readVarBuf status %d", ir.status)
+	if ir.status < loadedVarHeaders {
+		return fmt.Errorf("invalid client status for readVarBuf status %d", ir.status)
 	}
 
 	// lock the varBuf to prevent multiple go routines accessing while updating
@@ -291,19 +353,27 @@ func (ir *Client) readVarBuf() error {
 	return nil
 }
 
-func (ir *Client) readVar() error {
+func (ir *Client) readVar(varName string) (*IracingVariable, error) {
 	if ir.status != loadedVarBuf {
-		return fmt.Errorf("invalid client statis for readVar status %d", ir.status)
+		return nil, fmt.Errorf("invalid client statis for readVar status %d", ir.status)
 	}
 
 	// before reading vars make sure buffer isn't rewritten
 	ir.varBufLock.Lock()
 	defer ir.varBufLock.Unlock()
 
-	vH := ir.varHeaders["RPM"]
-	revs := binary.LittleEndian.Uint32(ir.varBuf[vH.offset : vH.offset+4])
-	ir.logger.Debug("varriable", zap.Uint32("revs", revs))
-	return nil
+	vH := ir.varHeaders[varName]
+	if vH == nil {
+		return nil, fmt.Errorf("variable name not found %s", varName)
+	}
+
+	raw := binary.LittleEndian.Uint32(ir.varBuf[vH.offset : vH.offset+4])
+	v := &IracingVariable{
+		Name:  varName,
+		Value: math.Float32frombits(raw),
+	}
+
+	return v, nil
 }
 
 func (ir *Client) readSession() error {

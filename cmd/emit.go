@@ -20,6 +20,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var varName string
+
 // emitCmd represents the emit command
 var emitCmd = &cobra.Command{
 	Use:   "emit",
@@ -29,12 +31,12 @@ var emitCmd = &cobra.Command{
 		The intention of emit is to enalbe goiracing to continually read `,
 	Run: func(cmd *cobra.Command, args []string) {
 		cfg := &iracing.ClientConfig{
-			Debug:         true,
+			Debug:         debug,
 			RetryInterval: 5,
 		}
 
 		client := iracing.NewClient(cfg)
-		client.Emit()
+		client.Emit(varName)
 	},
 }
 
@@ -49,5 +51,5 @@ func init() {
 
 	// Cobra supports local flags which will only run when this command
 	// is called directly, e.g.:
-	// emitCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	emitCmd.Flags().StringVarP(&varName, "variable", "v", "", "iRacing variable name e.g. RPM")
 }
