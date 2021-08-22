@@ -70,10 +70,9 @@ func (ir *Client) Emit(varName string) {
 
 	// setup signal channels to run reads in background
 	sigReadVarBuf := make(chan bool, 1)
-	sigReadVar := make(chan string, 16)
 
 	// start ticker to invoke variable reads
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(20 * time.Millisecond)
 	go func() {
 		for {
 			t := <-ticker.C
@@ -87,29 +86,23 @@ func (ir *Client) Emit(varName string) {
 	}()
 
 	go func() {
-		for {
-			<-sigReadVarBuf
-			ir.logger.Debug("read variable", zap.String("name", varName))
-			// will have to have a precache of variable offsets to read. Think about that later
-			// currently throwing only one value
-			sigReadVar <- varName
-		}
-	}()
-
-	go func() {
 		// setup output
 		o := &Output{}
 		out := o.OutputChannel()
-		// then read names to read values for
 		for {
-			name := <-sigReadVar
-			iv, err := ir.readVar(name)
-			if err != nil {
-				ir.logger.Error("error reading variable", zap.String("name", name), zap.Error(err))
+			<-sigReadVarBuf
+			s := &Suspension{
+				LFShockDef: ir.readFloat32Var("LFshockDef"),
+				LFShockVel: ir.readFloat32Var("LFshockVel"),
+				RFShockDef: ir.readFloat32Var("RFshockDef"),
+				RFShockVel: ir.readFloat32Var("RFshockVel"),
+				LRShockDef: ir.readFloat32Var("LRshockDef"),
+				LRShockVel: ir.readFloat32Var("LRshockVel"),
+				RRShockDef: ir.readFloat32Var("RRshockDef"),
+				RRShockVel: ir.readFloat32Var("RRshockVel"),
 			}
-			out <- iv
+			out <- s
 		}
-
 	}()
 
 	// graceful shutdown figure this out once it works
@@ -353,9 +346,9 @@ func (ir *Client) readVarBuf() error {
 	return nil
 }
 
-func (ir *Client) readVar(varName string) (*IracingVariable, error) {
+func (ir *Client) readFloat32Var(varName string) float32 {
 	if ir.status != loadedVarBuf {
-		return nil, fmt.Errorf("invalid client statis for readVar status %d", ir.status)
+		return 0
 	}
 
 	// before reading vars make sure buffer isn't rewritten
@@ -364,16 +357,11 @@ func (ir *Client) readVar(varName string) (*IracingVariable, error) {
 
 	vH := ir.varHeaders[varName]
 	if vH == nil {
-		return nil, fmt.Errorf("variable name not found %s", varName)
+		return 0
 	}
 
 	raw := binary.LittleEndian.Uint32(ir.varBuf[vH.offset : vH.offset+4])
-	v := &IracingVariable{
-		Name:  varName,
-		Value: math.Float32frombits(raw),
-	}
-
-	return v, nil
+	return math.Float32frombits(raw)
 }
 
 func (ir *Client) readSession() error {

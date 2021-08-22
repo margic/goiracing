@@ -20,7 +20,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var varName string
+var varName string // going to ignore this for now and return a hard coded suspension object
 
 // emitCmd represents the emit command
 var emitCmd = &cobra.Command{
